@@ -1,4 +1,4 @@
-name: Build MrRSS Image on Upstream Release
+name: Build and Push MrRSS to GHCR
 
 on:
   schedule:
@@ -21,67 +21,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. 获取上游最新的 Tag 名字
-      - name: Get upstream latest commit SHA
-        id: get_tag
+      # 1. 检测上游仓库的最新 Commit SHA
+      - name: Get upstream latest commit
+        id: upstream
         run: |
-            SHA=$(git ls-remote https://github.com/WCY-dt/MrRSS.git HEAD | awk '{print $1}')
-            echo "sha=$SHA" >> $GITHUB_OUTPUT
+          SHA=$(git ls-remote https://github.com/WCY-dt/MrRSS.git HEAD | awk '{print $1}')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
 
-      # 2. 检查本地是否已经记录过这个 Tag（避免重复构建）
-      - name: Check if tag already built
-        id: check_built
-        run: |
-          if [ -f "last_built_tag.txt" ] && [ "$(cat last_built_tag.txt)" == "${{ steps.get_tag.outputs.tag }}" ]; then
-            echo "built=true" >> $GITHUB_OUTPUT
-          else
-            echo "built=false" >> $GITHUB_OUTPUT
-          fi
+      # 2. 缓存机制：对比上次构建的 SHA，避免重复构建（可选但推荐）
+      - name: Cache upstream SHA
+        id: cache-sha
+        uses: actions/cache@v4
+        with:
+          path: last_sha.txt
+          key: upstream-sha-${{ steps.upstream.outputs.sha }}
 
+      # 3. 如果 SHA 变化了，则执行构建
+      - name: Clone upstream repo
+        if: steps.cache-sha.outputs.cache-hit != 'true'
+        run: git clone https://github.com/WCY-dt/MrRSS.git upstream
+
+        
       # 3. 设置 Docker Buildx (支持多架构的关键)
       - name: Set up QEMU
-        if: steps.check_built.outputs.built == 'false'
+        if: steps.cache-sha.outputs.cache-hit != 'true'
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.check_built.outputs.built == 'false'
+        if: steps.cache-sha.outputs.cache-hit != 'true'
         uses: docker/setup-buildx-action@v3
 
-      # 4. 登录 GHCR
       - name: Log in to GHCR
-        if: steps.check_built.outputs.built == 'false'
+        if: steps.cache-sha.outputs.cache-hit != 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5. 克隆上游指定 Tag 的代码
-      - name: Clone upstream tag
-        if: steps.check_built.outputs.built == 'false'
-        run: git clone --branch ${{ steps.get_tag.outputs.tag }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
-
-      # 6. 构建并推送多架构镜像
-      - name: Build and push
-        if: steps.check_built.outputs.built == 'false'
+      - name: Build and push Docker image
+        if: steps.cache-sha.outputs.cache-hit != 'true'
         uses: docker/build-push-action@v5
         with:
           context: upstream
-          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get_tag.outputs.tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.upstream.outputs.sha }}
 
-      # 7. 更新本地 Tag 记录并提交回仓库
-      - name: Update tag record
-        if: steps.check_built.outputs.built == 'false'
-        run: |
-          echo "${{ steps.get_tag.outputs.tag }}" > last_built_tag.txt
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add last_built_tag.txt
-          git commit -m "Update last built tag to ${{ steps.get_tag.outputs.tag }}"
-          git push
+      # 4. 更新缓存记录
+      - name: Save SHA
+        if: steps.cache-sha.outputs.cache-hit != 'true'
+        run: echo "${{ steps.upstream.outputs.sha }}" > last_sha.txt
